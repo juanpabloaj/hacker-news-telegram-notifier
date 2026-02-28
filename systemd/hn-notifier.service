@@ -1,0 +1,18 @@
+[Unit]
+Description=Hacker News Telegram Notifier
+After=network-online.target
+Wants=network-online.target
+# OnFailure=notify-telegram@%n.service
+
+[Service]
+Type=simple
+User=<APP_USER>
+Group=<APP_USER>
+WorkingDirectory=<APP_DIR>
+EnvironmentFile=<APP_DIR>/.env
+ExecStart=<APP_DIR>/.venv/bin/python <APP_DIR>/hn_notifier.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

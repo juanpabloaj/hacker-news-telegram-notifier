@@ -95,6 +95,11 @@ Stop:
 docker compose down
 ```
 
+## systemd unit template
+
+A generic `systemd` unit file is available at `systemd/hn-notifier.service`.
+Replace `<APP_USER>` and `<APP_DIR>` with your server values before installing it in `/etc/systemd/system/`.
+
 ## How it works
 
 1. On startup, the app reads all `submitted` item IDs for your user.
