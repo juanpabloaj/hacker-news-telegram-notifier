@@ -130,6 +130,8 @@ class StateStore:
 
     def replace_monitored_items(self, item_ids: Iterable[int]) -> None:
         with self.conn:
+            # Keep compatibility with older DBs where item_kids FK might not have ON DELETE CASCADE.
+            self.conn.execute("DELETE FROM item_kids")
             self.conn.execute("DELETE FROM monitored_items")
             self.conn.executemany(
                 "INSERT OR IGNORE INTO monitored_items(item_id) VALUES (?)",
