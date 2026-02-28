@@ -1,0 +1,9 @@
+services:
+  hn-notifier:
+    build: .
+    container_name: hn-notifier
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./state.db:/app/state.db

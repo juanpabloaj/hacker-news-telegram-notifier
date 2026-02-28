@@ -1,0 +1,13 @@
+[project]
+name = "hacker-news-notifier"
+version = "0.1.0"
+description = "Send Telegram notifications for new comments and replies on Hacker News submissions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "python-dotenv==1.1.1",
+  "requests==2.32.5",
+]
+
+[tool.uv]
+package = false
