@@ -6,8 +6,9 @@ A simple Python service that polls Hacker News and sends Telegram notifications 
 
 - Monitors all IDs from `user/{username}.json -> submitted`.
 - Stores tracked child comments (`kids`) in SQLite (`state.db`).
-- Sends Telegram notifications for new child comments only.
-- First startup is bootstrap-only (no notifications for existing comments).
+- Sends Telegram notifications once per comment (`kid_id`) using persistent deduplication.
+- First startup is baseline-only (no notifications for pre-existing comments).
+- Restarts continue from saved state (no full re-bootstrap), so comments that arrived during downtime are detected on the next poll.
 - Configurable polling interval (default 5 minutes).
 - Simple retry logic for temporary network/API errors.
 - Docker and Docker Compose support.
@@ -75,7 +76,7 @@ pip install -r requirements.txt
 python hn_notifier.py
 ```
 
-The service will bootstrap state first and then run forever.
+On first run, the service creates an initial baseline and then runs forever.
 
 ## 6) Run with Docker
 
@@ -102,19 +103,15 @@ Replace `<APP_USER>` and `<APP_DIR>` with your server values before installing i
 
 ## How it works
 
-1. On startup, the app reads all `submitted` item IDs for your user.
-2. It stores those IDs and the current `kids` values in SQLite.
+1. On the first run only, the app stores a baseline of your `submitted` items and existing `kids` (no historical notifications).
+2. On later restarts, it reuses `state.db` and continues from previous state.
 3. Every polling cycle:
-   - It refreshes submitted IDs and adds newly submitted items.
+   - It refreshes submitted IDs, removes stale ones, and adds newly discovered ones.
    - It checks each monitored item for new `kids`.
-   - For each new child comment ID, it fetches details and sends Telegram notification:
-     - author
-     - text preview (max 300 chars)
-     - direct Hacker News link
-4. It stores new child IDs so each comment is notified once.
+   - It sends Telegram notifications for unseen `kid_id` values and marks them as notified.
 
 ## Notes
 
 - HN comment text can include minimal HTML; the service strips tags for Telegram readability.
 - If Hacker News or Telegram fails temporarily, requests are retried.
-- The persistent `state.db` file allows safe restarts without duplicate notifications.
+- The persistent `state.db` file prevents duplicate notifications and supports catch-up after restarts.

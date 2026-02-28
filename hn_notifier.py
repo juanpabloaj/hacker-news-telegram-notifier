@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence, Set
+from typing import Any, Iterable, Optional, Set
 
 import requests
 from dotenv import load_dotenv
@@ -38,9 +38,7 @@ def load_settings() -> Settings:
     hn_username = os.getenv("HN_USERNAME", "").strip()
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    interval_raw = os.getenv(
-        "POLL_INTERVAL_MINUTES", str(DEFAULT_POLL_INTERVAL_MINUTES)
-    ).strip()
+    interval_raw = os.getenv("POLL_INTERVAL_MINUTES", str(DEFAULT_POLL_INTERVAL_MINUTES)).strip()
 
     missing = [
         name
@@ -51,11 +49,8 @@ def load_settings() -> Settings:
         ]
         if not value
     ]
-
     if missing:
-        raise ValueError(
-            f"Missing required environment variables: {', '.join(missing)}"
-        )
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
     try:
         interval = max(1, int(interval_raw))
@@ -71,12 +66,13 @@ def load_settings() -> Settings:
 
 
 class StateStore:
-    """SQLite-backed storage for monitored items and known child IDs."""
+    """SQLite-backed storage for monitored items and notification deduplication."""
 
     def __init__(self, db_path: str = "state.db") -> None:
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA foreign_keys=ON;")
         self._create_tables()
 
     def _create_tables(self) -> None:
@@ -93,13 +89,46 @@ class StateStore:
                 item_id INTEGER NOT NULL,
                 kid_id INTEGER NOT NULL,
                 PRIMARY KEY (item_id, kid_id),
-                FOREIGN KEY (item_id) REFERENCES monitored_items(item_id)
+                FOREIGN KEY (item_id) REFERENCES monitored_items(item_id) ON DELETE CASCADE
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notified_kids (
+                kid_id INTEGER PRIMARY KEY,
+                notified_at INTEGER NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
             """
         )
         self.conn.commit()
 
-    def replace_monitored_items(self, item_ids: Sequence[int]) -> None:
+    def reset_state(self) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM item_kids")
+            self.conn.execute("DELETE FROM monitored_items")
+            self.conn.execute("DELETE FROM notified_kids")
+            self.conn.execute("DELETE FROM metadata")
+
+    def add_monitored_items(self, item_ids: Iterable[int]) -> None:
+        rows = [(item_id,) for item_id in item_ids]
+        if not rows:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO monitored_items(item_id) VALUES (?)",
+                rows,
+            )
+
+    def replace_monitored_items(self, item_ids: Iterable[int]) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM monitored_items")
             self.conn.executemany(
@@ -107,26 +136,53 @@ class StateStore:
                 [(item_id,) for item_id in item_ids],
             )
 
-    def get_monitored_items(self) -> List[int]:
-        rows = self.conn.execute(
-            "SELECT item_id FROM monitored_items ORDER BY item_id"
-        ).fetchall()
+    def remove_monitored_items(self, item_ids: Iterable[int]) -> None:
+        rows = [(item_id,) for item_id in item_ids]
+        if not rows:
+            return
+        with self.conn:
+            self.conn.executemany("DELETE FROM item_kids WHERE item_id = ?", rows)
+            self.conn.executemany("DELETE FROM monitored_items WHERE item_id = ?", rows)
+
+    def get_monitored_items(self) -> list[int]:
+        rows = self.conn.execute("SELECT item_id FROM monitored_items ORDER BY item_id").fetchall()
         return [row[0] for row in rows]
 
     def get_known_kids(self, item_id: int) -> Set[int]:
-        rows = self.conn.execute(
-            "SELECT kid_id FROM item_kids WHERE item_id = ?", (item_id,)
-        ).fetchall()
+        rows = self.conn.execute("SELECT kid_id FROM item_kids WHERE item_id = ?", (item_id,)).fetchall()
         return {row[0] for row in rows}
 
     def add_kids(self, item_id: int, kid_ids: Iterable[int]) -> None:
-        kid_rows = [(item_id, kid_id) for kid_id in kid_ids]
-        if not kid_rows:
+        rows = [(item_id, kid_id) for kid_id in kid_ids]
+        if not rows:
             return
         with self.conn:
             self.conn.executemany(
                 "INSERT OR IGNORE INTO item_kids(item_id, kid_id) VALUES (?, ?)",
-                kid_rows,
+                rows,
+            )
+
+    def is_kid_notified(self, kid_id: int) -> bool:
+        row = self.conn.execute("SELECT 1 FROM notified_kids WHERE kid_id = ?", (kid_id,)).fetchone()
+        return row is not None
+
+    def mark_kid_notified(self, kid_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO notified_kids(kid_id, notified_at) VALUES (?, ?)",
+                (kid_id, int(time.time())),
+            )
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_metadata(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
             )
 
 
@@ -134,7 +190,7 @@ class HNClient:
     def __init__(self, session: requests.Session) -> None:
         self.session = session
 
-    def fetch_user_submitted_ids(self, username: str) -> List[int]:
+    def fetch_user_submitted_ids(self, username: str) -> list[int]:
         data = self._get_json(HN_USER_URL.format(username=username))
         submitted = data.get("submitted", []) if isinstance(data, dict) else []
         return [item_id for item_id in submitted if isinstance(item_id, int)]
@@ -146,28 +202,20 @@ class HNClient:
     def _get_json(self, url: str) -> Any:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = self.session.get(
-                    url, timeout=REQUEST_TIMEOUT_SECONDS
-                )
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
                 response.raise_for_status()
                 return response.json()
             except requests.RequestException as exc:
                 if attempt == MAX_RETRIES:
-                    raise RuntimeError(
-                        f"GET {url} failed after {MAX_RETRIES} attempts"
-                    ) from exc
+                    raise RuntimeError(f"GET {url} failed after {MAX_RETRIES} attempts") from exc
                 delay = RETRY_BACKOFF_SECONDS * attempt
-                logging.warning(
-                    "Request failed (%s). Retrying in %s seconds", exc, delay
-                )
+                logging.warning("Request failed (%s). Retrying in %s seconds", exc, delay)
                 time.sleep(delay)
         return None
 
 
 class TelegramClient:
-    def __init__(
-        self, session: requests.Session, bot_token: str, chat_id: str
-    ) -> None:
+    def __init__(self, session: requests.Session, bot_token: str, chat_id: str) -> None:
         self.session = session
         self.url = TELEGRAM_SEND_URL.format(token=bot_token)
         self.chat_id = chat_id
@@ -180,29 +228,19 @@ class TelegramClient:
         }
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = self.session.post(
-                    self.url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS
-                )
+                response = self.session.post(self.url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
                 response.raise_for_status()
                 body = response.json()
                 if not body.get("ok", False):
                     raise RuntimeError(f"Telegram API error: {body}")
                 return
-            except (
-                requests.RequestException,
-                ValueError,
-                RuntimeError,
-            ) as exc:
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
                 if attempt == MAX_RETRIES:
                     raise RuntimeError(
                         f"Failed to send Telegram message after {MAX_RETRIES} attempts"
                     ) from exc
                 delay = RETRY_BACKOFF_SECONDS * attempt
-                logging.warning(
-                    "Telegram send failed (%s). Retrying in %s seconds",
-                    exc,
-                    delay,
-                )
+                logging.warning("Telegram send failed (%s). Retrying in %s seconds", exc, delay)
                 time.sleep(delay)
 
 
@@ -243,50 +281,100 @@ def format_notification(comment_id: int, comment_data: dict[str, Any]) -> str:
     return f"New HN reply/comment by {author}:\n\n{clean_text}\n\n{link}"
 
 
-def bootstrap_state(
-    settings: Settings, hn_client: HNClient, store: StateStore
-) -> None:
-    logging.info("Initializing state for user '%s'", settings.hn_username)
+def send_comment_notification(
+    kid_id: int,
+    hn_client: HNClient,
+    tg_client: TelegramClient,
+    store: StateStore,
+) -> bool:
+    if store.is_kid_notified(kid_id):
+        return False
+
+    comment_data = hn_client.fetch_item(kid_id)
+    if not comment_data:
+        logging.warning("Could not fetch comment %s", kid_id)
+        return False
+
+    message = format_notification(kid_id, comment_data)
+    tg_client.send_notification(message)
+    store.mark_kid_notified(kid_id)
+    logging.info("Sent notification for comment %s", kid_id)
+    return True
+
+
+def bootstrap_initial_state(settings: Settings, hn_client: HNClient, store: StateStore) -> None:
+    """Initialize baseline only once. Existing comments are not notified."""
+    logging.info("Initializing baseline state for user '%s'", settings.hn_username)
+
     submitted_ids = hn_client.fetch_user_submitted_ids(settings.hn_username)
     store.replace_monitored_items(submitted_ids)
 
     for idx, item_id in enumerate(submitted_ids, start=1):
         item = hn_client.fetch_item(item_id)
-        kids = extract_kids(item)
-        store.add_kids(item_id, kids)
+        store.add_kids(item_id, extract_kids(item))
         if idx % 100 == 0:
             logging.info("Initialized %s/%s items", idx, len(submitted_ids))
 
-    logging.info(
-        "Bootstrap completed. Monitoring %s submitted items",
-        len(submitted_ids),
-    )
+    store.set_metadata("hn_username", settings.hn_username)
+    store.set_metadata("initialized_at", str(int(time.time())))
+    logging.info("Baseline bootstrap completed. Monitoring %s submitted items", len(submitted_ids))
+
+
+def ensure_state_initialized(settings: Settings, hn_client: HNClient, store: StateStore) -> None:
+    stored_username = store.get_metadata("hn_username")
+    if stored_username is None:
+        bootstrap_initial_state(settings, hn_client, store)
+        return
+
+    if stored_username != settings.hn_username:
+        logging.warning(
+            "Stored user '%s' differs from configured user '%s'. Resetting local state.",
+            stored_username,
+            settings.hn_username,
+        )
+        store.reset_state()
+        bootstrap_initial_state(settings, hn_client, store)
+        return
+
+    logging.info("Loaded existing state. Monitoring %s submitted items", len(store.get_monitored_items()))
 
 
 def refresh_monitored_items(
-    settings: Settings, hn_client: HNClient, store: StateStore
+    settings: Settings,
+    hn_client: HNClient,
+    tg_client: TelegramClient,
+    store: StateStore,
 ) -> None:
-    """Keep monitored item list in sync with current submitted IDs."""
+    """Sync monitored submitted items and notify comments already present on newly seen items."""
     latest_submitted = hn_client.fetch_user_submitted_ids(settings.hn_username)
-    current = set(store.get_monitored_items())
-    latest = set(latest_submitted)
-    new_items = latest - current
+    latest_set = set(latest_submitted)
+    current_set = set(store.get_monitored_items())
+
+    new_items = sorted(latest_set - current_set)
+    removed_items = sorted(current_set - latest_set)
+
+    if removed_items:
+        store.remove_monitored_items(removed_items)
+        logging.info("Removed %s stale submitted items", len(removed_items))
 
     if not new_items:
         return
 
-    store.replace_monitored_items(latest_submitted)
+    store.add_monitored_items(new_items)
+    logging.info("Discovered %s new submitted items", len(new_items))
+
     for item_id in new_items:
         item = hn_client.fetch_item(item_id)
         kids = extract_kids(item)
+        if not kids:
+            continue
+
         store.add_kids(item_id, kids)
+        for kid_id in sorted(kids):
+            send_comment_notification(kid_id, hn_client, tg_client, store)
 
-    logging.info("Discovered %s new submitted items", len(new_items))
 
-
-def poll_once(
-    hn_client: HNClient, tg_client: TelegramClient, store: StateStore
-) -> None:
+def poll_once(hn_client: HNClient, tg_client: TelegramClient, store: StateStore) -> None:
     monitored_items = store.get_monitored_items()
     logging.info("Polling %s monitored items", len(monitored_items))
 
@@ -299,19 +387,10 @@ def poll_once(
         if not new_kids:
             continue
 
-        logging.info(
-            "Found %s new comments for item %s", len(new_kids), item_id
-        )
+        logging.info("Found %s new comments for item %s", len(new_kids), item_id)
 
         for kid_id in new_kids:
-            comment_data = hn_client.fetch_item(kid_id)
-            if not comment_data:
-                logging.warning("Could not fetch new comment %s", kid_id)
-                continue
-
-            message = format_notification(kid_id, comment_data)
-            tg_client.send_notification(message)
-            logging.info("Sent notification for comment %s", kid_id)
+            send_comment_notification(kid_id, hn_client, tg_client, store)
 
         store.add_kids(item_id, new_kids)
 
@@ -337,26 +416,21 @@ def main() -> int:
     session.headers.update({"User-Agent": "hn-telegram-notifier/1.0"})
 
     hn_client = HNClient(session)
-    tg_client = TelegramClient(
-        session, settings.telegram_bot_token, settings.telegram_chat_id
-    )
+    tg_client = TelegramClient(session, settings.telegram_bot_token, settings.telegram_chat_id)
     store = StateStore(db_path="state.db")
 
     try:
-        bootstrap_state(settings, hn_client, store)
+        ensure_state_initialized(settings, hn_client, store)
     except Exception as exc:  # noqa: BLE001
-        logging.exception("Bootstrap failed: %s", exc)
+        logging.exception("State initialization failed: %s", exc)
         return 1
 
     interval_seconds = settings.poll_interval_minutes * 60
-    logging.info(
-        "Starting polling loop every %s minutes",
-        settings.poll_interval_minutes,
-    )
+    logging.info("Starting polling loop every %s minutes", settings.poll_interval_minutes)
 
     while True:
         try:
-            refresh_monitored_items(settings, hn_client, store)
+            refresh_monitored_items(settings, hn_client, tg_client, store)
             poll_once(hn_client, tg_client, store)
         except Exception as exc:  # noqa: BLE001
             logging.exception("Polling cycle failed: %s", exc)
