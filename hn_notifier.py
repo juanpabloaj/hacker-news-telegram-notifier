@@ -283,6 +283,17 @@ def format_notification(comment_id: int, comment_data: dict[str, Any]) -> str:
     return f"New HN reply/comment by {author}:\n\n{clean_text}\n\n{link}"
 
 
+def should_skip_comment(comment_data: dict[str, Any]) -> bool:
+    if comment_data.get("dead") is True or comment_data.get("deleted") is True:
+        return True
+
+    text = comment_data.get("text")
+    if isinstance(text, str) and strip_html_tags(text).strip().lower() in {"[dead]", "[deleted]"}:
+        return True
+
+    return False
+
+
 def send_comment_notification(
     kid_id: int,
     hn_client: HNClient,
@@ -295,6 +306,10 @@ def send_comment_notification(
     comment_data = hn_client.fetch_item(kid_id)
     if not comment_data:
         logging.warning("Could not fetch comment %s", kid_id)
+        return False
+
+    if should_skip_comment(comment_data):
+        logging.info("Skipping dead/deleted comment %s", kid_id)
         return False
 
     message = format_notification(kid_id, comment_data)
@@ -371,9 +386,9 @@ def refresh_monitored_items(
         if not kids:
             continue
 
-        store.add_kids(item_id, kids)
         for kid_id in sorted(kids):
             send_comment_notification(kid_id, hn_client, tg_client, store)
+        store.add_kids(item_id, kids)
 
 
 def poll_once(hn_client: HNClient, tg_client: TelegramClient, store: StateStore) -> None:
